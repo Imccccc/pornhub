@@ -3,19 +3,29 @@
 import os
 import json
 import re
+import sys
 
-# import urllib
-# import multiprocessing
 import requests
 from lxml import etree
 import fire
 from loguru import logger
+from tqdm import tqdm
+import math
 logger.add("logs/%s.log" % __file__.rstrip('.py'), format="{time:MM-DD HH:mm:ss} {level} {message}")
+
+# reuse request session 
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(max_retries=20)
+session.mount('https://', adapter)
+
 
 headers = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.84 Safari/537.36',
 }
-proxies = {}
+proxies = {
+    "http": "http://127.0.0.1:1087",
+    "https": "http://127.0.0.1:1087",
+}
 
 # 如果代理不稳定，不推荐使用
 # local showdowsocks service
@@ -28,7 +38,7 @@ proxies = {}
 
 def list_page(url):
     logger.info('crawling : %s' % url)
-    resp = requests.get(url, headers=headers, proxies=proxies)
+    resp = session.get(url, headers=headers, proxies=proxies)
     html = etree.HTML(resp.text)
     vkeys = html.xpath('//*[@class="phimage"]/div/a/@href')
     gif_keys = html.xpath('//*[@class="phimage"]/div/a/img/@data-mediabook')
@@ -60,25 +70,44 @@ def detail_page(url):
     for _dict in con['mediaDefinitions']:
         if 'quality' in _dict.keys() and _dict.get('videoUrl'):
             logger.info('%s %s' % (_dict.get('quality'), _dict.get('videoUrl')))
-            logger.info('start download...')
             try:
                 download(_dict.get('videoUrl'), title, 'mp4')
                 break  # 如下载了较高分辨率的视频 就跳出循环
             except Exception as err:
                 logger.error(err)
+                sys.exit(1)
 
 
+@logger.catch
 def download(url, name, filetype):
+    rep = session.get(url, headers=headers,
+                        proxies=proxies, stream=True, verify=False)
+    total_size = int(rep.headers.get('content-length', 0))
+    current_size = 0
     filepath = '%s/%s.%s' % (filetype, name, filetype)
     if os.path.exists(filepath):
-        logger.info('this file had been downloaded :: %s' % filepath)
-        return
+        current_size = os.path.getsize(filepath)
+        if (current_size >= total_size):
+            logger.info('this file had been downloaded :: %s' % filepath)
+            return
+        else:
+            headers['Range'] = 'bytes=%d-' % current_size
+            rep = session.get(url, stream=True, verify=False, headers=headers)
+            logger.info("restart download {} -- current={} totalsize={}", name, current_size, total_size)
     else:
-        rep = requests.get(url, headers=headers, proxies=proxies)
-        with open(filepath, 'wb') as file:
-            file.write(rep.content)
-        # urllib.request.urlretrieve(url, '%s' % filepath)
-        logger.info('download success :: %s' % filepath)
+        logger.info('start download... -- current={} totalsize={}',
+                    current_size, total_size)
+    block_size = 1024
+
+    with open(filepath, 'wb') as file:
+        for data in tqdm(rep.iter_content(block_size), total=math.ceil(total_size//block_size), unit='KB', unit_scale=True):
+            if data:
+                file.write(data)
+                current_size = current_size + len(data)
+    if current_size != total_size:
+        logger.error("download failed :: {}", filepath)
+    else:
+        logger.info('download success :: {}', filepath)
 
 
 def run(_arg=None):
